@@ -39,6 +39,12 @@
  *  - leak detect circuit/alarm support
  */
 
+/*
+ * Modified (very) slightly by Josh Pelkey <joshpelkey@gmail.com>
+ * for use with my serial LCD and push-button configuration.
+ * See kegbot.joshpelkey.com and kegbot.joshpelkey.com/kegSetup.html
+ */
+ 
 #include <WProgram.h>
 #include <avr/pgmspace.h>
 #include <string.h>
@@ -52,6 +58,33 @@
 #include "KegboardPacket.h"
 #include "version.h"
 
+/************************************************
+ * TAP AND USER LIST
+ *
+ * These are hard-coded and re-uploaded to the 
+ * arduino whenever a change is made. Not great, 
+ * but it's easy for now.
+ *
+ * NOTE: The user ID (i.e. the location in the 
+ * array) MUST match the auth_token set in the DB
+ ************************************************/
+  ////////////////////////////////////////////////
+  ////////////////////////////////////////////////
+  char tap0[] = "TCP/IPA";
+  char tap1[] = "Amaredco";
+
+  char* users[] = {"joshpelkey",
+                   "mschaef",
+                   "kristoj",
+                   "jwells",
+                   "guest",
+                   "growlers"
+                   };
+
+  uint32_t g_numUsers = 6;
+  ////////////////////////////////////////////////
+  ////////////////////////////////////////////////
+
 #if (KB_ENABLE_ONEWIRE_THERMO || KB_ENABLE_ONEWIRE_PRESENCE)
 #include "OneWire.h"
 #endif
@@ -60,18 +93,31 @@
 #include "buzzer.h"
 #endif
 
-#if KB_ENABLE_ID12_RFID
-#include "NewSoftSerial.h"
-NewSoftSerial gSerialRfid = NewSoftSerial(KB_PIN_SERIAL_RFID_RX, -1);
-int gRfidPos = -1;
-unsigned char gRfidChecksum = 0;
-unsigned char gRfidBuf[RFID_PAYLOAD_CHARS];
+#if KB_ENABLE_SERIAL_LCD
+#include <SoftwareSerial.h>
+SoftwareSerial LCD = SoftwareSerial(KB_PIN_SERIAL_LCD_RX,
+    KB_PIN_SERIAL_LCD_TX); // hook me up to pin 6
 #endif
 
-#if KB_ENABLE_MAGSTRIPE
-#include "MagStripe.h"
-#include "PCInterrupt.h"
-#endif
+/* moar globals needed for this program
+   ugly, I know
+ */
+long g_lastScreenChange = 0;
+uint8_t g_userId = g_numUsers - 1;
+int g_buttonState = LOW;
+int g_lastButtonState = LOW;
+boolean switchScreen = false;
+unsigned long g_lastButtonPress = 0;
+unsigned long g_lastAuth = 0;
+
+/* some proto defs */
+void incrementAndShowUser ();
+void forceAuthUser ();
+void clearLCD ();
+void screenChange ();
+void selectLineOne ();
+void selectLineTwo ();
+void backlight (int intensity);
 
 //
 // Other Globals
@@ -80,14 +126,7 @@ unsigned char gRfidBuf[RFID_PAYLOAD_CHARS];
 // Up to 6 meters supported if using Arduino Mega
 static unsigned long volatile gMeters[] = {0, 0, 0, 0, 0, 0};
 static unsigned long volatile gLastMeters[] = {0, 0, 0, 0, 0, 0};
-static uint8_t gOutputPins[] = {
-  KB_PIN_RELAY_A,
-  KB_PIN_RELAY_B,
-  KB_PIN_RELAY_C,
-  KB_PIN_RELAY_D,
-  KB_PIN_LED_FLOW_A,
-  KB_PIN_LED_FLOW_B
-};
+static uint8_t gOutputPins[] = {KB_PIN_RELAY_A, KB_PIN_RELAY_B};
 
 static KegboardPacket gInputPacket;
 
@@ -150,17 +189,7 @@ PROGMEM prog_uint16_t BOOT_MELODY[] = {
 
   MELODY_NOTE(0, NOTE_SILENCE, 0)
 };
-
-#if (KB_ENABLE_ID12_RFID || KB_ENABLE_ONEWIRE_PRESENCE)
-PROGMEM prog_uint16_t AUTH_ON_MELODY[] = {
-  MELODY_NOTE(4, 1, 50), MELODY_NOTE(0, NOTE_SILENCE, 10),
-  MELODY_NOTE(4, 4, 50 ), MELODY_NOTE(0, NOTE_SILENCE, 10),
-  MELODY_NOTE(4, 8, 50),
-
-  MELODY_NOTE(0, NOTE_SILENCE, 0)
-};
-#endif  // KB_ENABLE_ID12_RFID || KB_ENABLE_ONEWIRE_PRESENCE
-#endif  // KB_ENABLE_BUZZER
+#endif
 
 #if KB_ENABLE_ONEWIRE_THERMO
 static OneWire gOnewireThermoBus(KB_PIN_ONEWIRE_THERMO);
@@ -169,10 +198,6 @@ static DS1820Sensor gThermoSensor;
 
 #if KB_ENABLE_ONEWIRE_PRESENCE
 static OneWire gOnewireIdBus(KB_PIN_ONEWIRE_PRESENCE);
-#endif
-
-#if KB_ENABLE_MAGSTRIPE
-static MagStripe gMagStripe(KB_PIN_MAGSTRIPE_CLOCK, KB_PIN_MAGSTRIPE_DATA, KB_PIN_MAGSTRIPE_CARD_PRESENT);
 #endif
 
 //
@@ -184,12 +209,10 @@ void meterInterruptA()
   gMeters[0] += 1;
 }
 
-#ifdef KB_PIN_METER_B
 void meterInterruptB()
 {
   gMeters[1] += 1;
 }
-#endif
 
 #ifdef KB_PIN_METER_C
 void meterInterruptC()
@@ -216,13 +239,6 @@ void meterInterruptE()
 void meterInterruptF()
 {
   gMeters[5] += 1;
-}
-#endif
-
-#if KB_ENABLE_MAGSTRIPE
-void magStripeClockInterrupt()
-{
-  gMagStripe.clockData();
 }
 #endif
 
@@ -293,6 +309,7 @@ void writeMeterPacket(int channel)
   } else {
     gLastMeters[channel] = status;
   }
+  
   name[4] = 0x30 + channel;
   KegboardPacket packet;
   packet.SetType(KBM_METER_STATUS);
@@ -309,11 +326,6 @@ void writeAuthPacket(char* device_name, uint8_t* token, int token_len,
   packet.AddTag(KBM_AUTH_TOKEN_TAG_TOKEN, token_len, (char*)token);
   packet.AddTag(KBM_AUTH_TOKEN_TAG_STATUS, 1, &status);
   packet.Print();
-#if KB_ENABLE_BUZZER
-  if (status == 1) {
-    playMelody(AUTH_ON_MELODY);
-  }
-#endif
 }
 
 #if KB_ENABLE_SELFTEST
@@ -347,11 +359,9 @@ void setup()
   digitalWrite(KB_PIN_METER_A, HIGH);
   attachInterrupt(0, meterInterruptA, RISING);
 
-#ifdef KB_PIN_METER_B
   pinMode(KB_PIN_METER_B, INPUT);
   digitalWrite(KB_PIN_METER_B, HIGH);
   attachInterrupt(1, meterInterruptB, RISING);
-#endif
 
 #ifdef KB_PIN_METER_C
   pinMode(KB_PIN_METER_C, INPUT);
@@ -379,10 +389,6 @@ void setup()
 
   pinMode(KB_PIN_RELAY_A, OUTPUT);
   pinMode(KB_PIN_RELAY_B, OUTPUT);
-  pinMode(KB_PIN_RELAY_C, OUTPUT);
-  pinMode(KB_PIN_RELAY_D, OUTPUT);
-  pinMode(KB_PIN_LED_FLOW_A, OUTPUT);
-  pinMode(KB_PIN_LED_FLOW_B, OUTPUT);
   pinMode(KB_PIN_ALARM, OUTPUT);
   pinMode(KB_PIN_TEST_PULSE, OUTPUT);
 
@@ -394,14 +400,16 @@ void setup()
   playMelody(BOOT_MELODY);
 #endif
 
-#if KB_ENABLE_ID12_RFID
-  gSerialRfid.begin(9600);
-  pinMode(KB_PIN_RFID_RESET, OUTPUT);
-  digitalWrite(KB_PIN_RFID_RESET, HIGH);
-#endif
-
-#if KB_ENABLE_MAGSTRIPE
-  PCattachInterrupt(KB_PIN_MAGSTRIPE_CLOCK, magStripeClockInterrupt, FALLING);
+#if KB_ENABLE_SERIAL_LCD
+  pinMode(KB_PIN_SERIAL_LCD_RX, INPUT);
+  pinMode(KB_PIN_SERIAL_LCD_TX, OUTPUT);
+  LCD.begin(9600);
+  delay(100);
+  clearLCD ();
+  delay (100);
+  backlight (156);
+  delay (100);
+  screenChange ();  
 #endif
 
   writeHelloPacket();
@@ -523,81 +531,13 @@ static void readSerialBytes(char *dest_buf, int num_bytes, int offset) {
   }
 }
 
-#if KB_ENABLE_ID12_RFID
-static void doProcessRfid() {
-  if (gSerialRfid.available() == 0) {
-    return;
-  }
-
-  if (gRfidPos == -1) {
-    if (gSerialRfid.read() != 0x02) {
-      return;
-    } else {
-      gRfidPos = 0;
-      gRfidChecksum = 0;
-    }
-  }
-
-  while (gRfidPos < 12) {
-    unsigned char b;
-    int rfid_index = (RFID_PAYLOAD_CHARS/2 - 1) - gRfidPos / 2;
-    if (gSerialRfid.available() == 0) {
-      return;
-    }
-
-    b = gSerialRfid.read();
-    if (b == CR || b == LF || b == STX || b == ETX) {
-      goto out_reset;
-    }
-
-    // ASCII to hex
-    if (b >= '0' && b <= '9') {
-      b -= '0';
-    } else if (b >= 'A' && b <= 'F') {
-      b -= 'A';
-      b += 10;
-    }
-
-    if ((gRfidPos % 2) == 0) {
-      // Clears previous value.
-      gRfidBuf[rfid_index] = b << 4;
-    } else {
-      gRfidBuf[rfid_index] |= b;
-      gRfidChecksum ^= gRfidBuf[rfid_index];
-    }
-
-    gRfidPos++;
-  }
-
-  if (gRfidPos == RFID_PAYLOAD_CHARS) {
-    if (gRfidChecksum == 0) {
-      writeAuthPacket("core.rfid", gRfidBuf+1, 5, 1);
-      writeAuthPacket("core.rfid", gRfidBuf+1, 5, 0);
-    }
-  }
-
-  digitalWrite(KB_PIN_RFID_RESET, LOW);
-  delay(200);
-  digitalWrite(KB_PIN_RFID_RESET, HIGH);
-
-out_reset:
-  gRfidPos = -1;
-  gRfidChecksum = 0;
-}
+void debug(const char* msg) {
+#if KB_ENABLE_SERIAL_LCD
+  clearLCD ();
+  LCD.print(msg);
+  delay(500);
 #endif
-
-#if KB_ENABLE_MAGSTRIPE
-void doProcessMagStripe()
-{
-  // Return if there is no data
-  uint8_t* data;
-  int dataSize = gMagStripe.getData(&data);
-  if (dataSize <= 0) return;
-
-  writeAuthPacket("magstripe", data, dataSize, 1);
-  writeAuthPacket("magstripe", data, dataSize, 0);
 }
-#endif
 
 void resetInputPacket() {
   memset(&gPacketStat, 0, sizeof(RxPacketStat));
@@ -753,9 +693,7 @@ void writeMeterPackets() {
   }
 
   writeMeterPacket(0);
-#ifdef KB_PIN_METER_B
   writeMeterPacket(1);
-#endif
 #ifdef KB_PIN_METER_C
   writeMeterPacket(2);
 #endif
@@ -781,6 +719,119 @@ void stepRelayWatchdog() {
   }
 }
 
+void checkButton ()
+{ 
+  // Check button state
+  g_buttonState = digitalRead(KB_PIN_ONEWIRE_PRESENCE);
+  
+  // if button is pressed
+  if (g_buttonState == HIGH)
+    {
+      // and the button wasn't pressed before
+      if (!g_lastButtonState)
+       {
+         
+         // capture last button press time
+         g_lastButtonPress = millis ();
+         
+         // show the current user
+         incrementAndShowUser ();
+       }
+       
+       // and change the last button state,
+       // as we've pressed it
+      g_lastButtonState = HIGH;
+      return;
+    }
+  // however, if the button isn't pressed, 
+  // but it was before
+  else if (g_lastButtonState)
+  {
+    // reset last button
+    g_lastButtonState = LOW;
+    forceAuthUser ();
+  }
+  else
+  {
+    unsigned long currentMillis = millis ();
+    
+    // If last button press was over 10 seconds ago, 
+    // reset to me
+    if (currentMillis - g_lastButtonPress >= 10000)
+    {
+      // reset to default user (me!), so next time I press the 
+      // button, it shows my username and auths to me
+      // set to numUsers - 1 b/c there is some modulo arith.
+      // on a button press
+      g_userId = g_numUsers - 1;
+      
+      // now let's just scroll through some screen changes
+      if (currentMillis - g_lastScreenChange >= 5000)
+      {
+        g_lastScreenChange = currentMillis;
+        screenChange ();
+      }
+    }
+  }
+}
+
+void incrementAndShowUser ()
+{
+  // increment the user id for 
+  // next button press
+  g_userId = (g_userId + 1) % g_numUsers;
+  
+  clearLCD ();
+  LCD.print("user: ");
+  LCD.print(users[g_userId]);
+}
+
+void forceAuthUser ()
+{
+  writeAuthPacket("button", &g_userId, 1, 1);
+  writeAuthPacket("button", &g_userId, 1, 0);
+  writeAuthPacket("button", &g_userId, 1, 1);
+}
+
+void screenChange ()
+{
+  if (switchScreen)
+  {
+    clearLCD ();
+    LCD.print("Left: ");
+    LCD.print(tap0);
+    selectLineTwo ();
+    LCD.print("Right: ");
+    LCD.print(tap1);
+  }
+  else
+  {
+    clearLCD ();
+    LCD.print("__thoughtloss___");
+    LCD.print("_____brewing____");
+  }
+  switchScreen = !switchScreen;
+}
+
+void backlight (int intensity)
+{
+  LCD.print(0x7C, BYTE);   //command flag for backlight stuff
+  LCD.print(intensity, BYTE);    //light level.
+}
+void clearLCD(){
+   LCD.print(0xFE, BYTE); //command flag
+   LCD.print(0x01, BYTE); //clear command.
+}
+
+void selectLineOne(){  //puts the cursor at line 0 char 0.
+   LCD.print(0xFE, BYTE);   //command flag
+   LCD.print(128, BYTE);    //position
+}
+void selectLineTwo(){  //puts the cursor at line 0 char 0.
+   LCD.print(0xFE, BYTE);   //command flag
+   LCD.print(192, BYTE);    //position
+}
+
 void loop()
 {
   updateTimekeeping();
@@ -789,6 +840,9 @@ void loop()
   handleInputPacket();
 
   writeMeterPackets();
+  
+  checkButton ();
+  
   stepRelayWatchdog();
 
 #if KB_ENABLE_ONEWIRE_THERMO
@@ -797,14 +851,6 @@ void loop()
 
 #if KB_ENABLE_ONEWIRE_PRESENCE
   stepOnewireIdBus();
-#endif
-
-#if KB_ENABLE_ID12_RFID
-  doProcessRfid();
-#endif
-
-#if KB_ENABLE_MAGSTRIPE
-  doProcessMagStripe();
 #endif
 
 #if KB_ENABLE_SELFTEST
