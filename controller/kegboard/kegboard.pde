@@ -70,18 +70,21 @@
  ************************************************/
   ////////////////////////////////////////////////
   ////////////////////////////////////////////////
-  char tap0[] = "TCP/IPA";
-  char tap1[] = "Amaredco";
+  char tap0[] = "--empty--";
+  char tap1[] = "Dunvegan";
 
   char* users[] = {"joshpelkey",
                    "mschaef",
                    "kristoj",
                    "jwells",
                    "guest",
-                   "growlers"
+                   "growlers",
+                   "jticknor",
+                   "rrenwick",
+                   "dboren"
                    };
 
-  uint32_t g_numUsers = 6;
+  uint32_t g_numUsers = 9;
   ////////////////////////////////////////////////
   ////////////////////////////////////////////////
 
