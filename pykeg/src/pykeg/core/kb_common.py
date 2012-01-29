@@ -3,7 +3,7 @@ from pykeg.core import util
 ### Drink-related constants
 
 # Don't record teeny drinks
-MIN_VOLUME_TO_RECORD = 10
+MIN_VOLUME_TO_RECORD = 80
 
 # Don't show small drinks
 MIN_VOLUME_TO_DISPLAY = 10
